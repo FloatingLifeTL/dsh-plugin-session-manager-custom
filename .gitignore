@@ -1,0 +1,9 @@
+# Node / DSH 本地产物
+node_modules/
+*.log
+*.tgz
+TempData/
+
+# GitHub 工作流与本地产物
+dist/
+build/

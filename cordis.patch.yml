@@ -1,0 +1,4 @@
+- insert:
+    - id: session-manager-custom
+      name: '@dsh-local/session-manager-custom'
+      inject: [webServer, workspaceRegistry, sessionQuery]

@@ -2,16 +2,18 @@
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { access as accessPromise } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { zstdCompressSync } from 'node:zlib'
 
 // 测试使用独立 DSH_HOME，避免读取或写入用户 profile 中真实的 trash/backup 清单。
 // 由于 index.js 在模块加载时读取 DSH_HOME，因此必须先设置环境变量再动态导入。
 const testHome = mkdtempSync(join(tmpdir(), 'session-manager-custom-test-'))
 process.env.DSH_HOME = testHome
-const { apply } = await import('../index.js')
+const { apply, version } = await import('../index.js')
 
 after(() => {
   rmSync(testHome, { recursive: true, force: true })
@@ -45,6 +47,37 @@ function createContext() {
   return { ctx, route: routes[0] }
 }
 
+/** 构造带 workspace/session_projcache 两个领域的最小 storageDomain mock。 */
+function createFakeStorageDomain({ workspaceRecords = {}, cacheIds = [], archived = [] } = {}) {
+  const cacheKeys = new Set(cacheIds)
+  const workspaceState = { archivedSessionIds: archived }
+  const workspaceTable = {
+    entries: () => Object.entries(workspaceRecords),
+    get: (id) => workspaceRecords[id],
+    update: async (id, fn) => {
+      const next = fn(workspaceRecords[id])
+      workspaceRecords[id] = next
+      return next
+    }
+  }
+  const cacheTable = {
+    keys: () => cacheKeys[Symbol.iterator](),
+    get: (id) => cacheKeys.has(id) ? {} : undefined,
+    delete: async (id) => cacheKeys.delete(id)
+  }
+  return {
+    workspaceTable,
+    cacheTable,
+    workspaceState,
+    cacheIds: cacheKeys,
+    get: (name) => name === 'workspace'
+      ? { table: () => workspaceTable, global: { get: () => workspaceState, set: async (value) => { workspaceState.archivedSessionIds = value.archivedSessionIds } } }
+      : name === 'session_projcache'
+        ? { table: () => cacheTable }
+        : undefined
+  }
+}
+
 /** 用 EventEmitter 模拟请求，触发 route 并返回最终 HTTP 状态和 JSON。 */
 async function invoke(route, body) {
   const req = new EventEmitter()
@@ -74,6 +107,22 @@ test('list returns an empty session list', async () => {
   assert.equal(result.json.ok, true)
   assert.deepEqual(result.json.items, [])
   assert.equal(result.json.counts.all, 0)
+})
+
+test('version comes from the plugin package.json declaration', async () => {
+  const packagePath = fileURLToPath(new URL('../package.json', import.meta.url))
+  const packageVersion = JSON.parse(readFileSync(packagePath, 'utf8')).version
+  const clientPath = fileURLToPath(new URL('../client.js', import.meta.url))
+  const clientSource = readFileSync(clientPath, 'utf8')
+  const { route } = createContext()
+
+  const result = await invoke(route, { method: 'version', args: {} })
+
+  assert.equal(version, packageVersion)
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.equal(result.json.version, packageVersion)
+  assert.equal(clientSource.includes(`v${packageVersion}`), false)
 })
 
 test('request body limit is measured in bytes', async () => {
@@ -362,4 +411,422 @@ test('backup safely ends a live archived session before file validation', async 
   assert.equal(disposed, true)
   assert.equal(detached, true)
   assert.equal(deleted, true)
+})
+
+test('cleanup removes stale cache rows, workspace references and archive IDs', async () => {
+  const { ctx, route } = createContext()
+  const workspaceRecords = {
+    ws: { id: 'ws', path: '/workspace', sessionIds: ['session-live', 'session-stale'] }
+  }
+  const detached = []
+  const workspace = {
+    id: 'ws',
+    sessionIds: workspaceRecords.ws.sessionIds,
+    detachSession: async (id) => {
+      detached.push(id)
+      workspaceRecords.ws.sessionIds = workspaceRecords.ws.sessionIds.filter((item) => item !== id)
+      workspace.sessionIds = workspaceRecords.ws.sessionIds
+    }
+  }
+  const storage = createFakeStorageDomain({
+    workspaceRecords,
+    cacheIds: ['session-live', 'session-stale'],
+    archived: ['session-stale']
+  })
+  const originalGet = ctx.get
+  ctx.get = (name) => name === 'storageDomain' ? storage : originalGet(name)
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id: 'session-live' }, live: false, persisted: true }
+  ]
+  ctx.workspaceRegistry.list = () => []
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = ['session-stale']
+  ctx.workspaceRegistry.setState = async (state) => { ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds }
+
+  const result = await invoke(route, { method: 'cleanup', args: {} })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.deepEqual(result.json.removedCacheIds, ['session-stale'])
+  assert.deepEqual(result.json.removedWorkspace, [{ workspaceId: 'ws', sessionId: 'session-stale' }])
+  assert.deepEqual(result.json.removedArchiveIds, ['session-stale'])
+  assert.deepEqual(detached, ['session-stale'])
+  assert.deepEqual(workspaceRecords.ws.sessionIds, ['session-live'])
+})
+
+test('moving a session to trash detaches workspace, archive marker and projection cache', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-move'
+  const sessionDir = join(testHome, 'sessions', id)
+  const sourcePath = join(sessionDir, 'session.jsonl')
+  mkdirSync(sessionDir, { recursive: true })
+  writeFileSync(sourcePath, `${JSON.stringify({ type: 'session', version: 0, id, createdAt: 1, cwd: '/workspace', delegationDepth: 0 })}\n`)
+  const workspaceRecords = { ws: { id: 'ws', path: '/workspace', sessionIds: [id] } }
+  const detached = []
+  const workspace = {
+    id: 'ws',
+    title: 'Workspace',
+    path: '/workspace',
+    sessionIds: [id],
+    detachSession: async (sessionId) => {
+      detached.push(sessionId)
+      workspaceRecords.ws.sessionIds = workspaceRecords.ws.sessionIds.filter((item) => item !== sessionId)
+      workspace.sessionIds = workspaceRecords.ws.sessionIds
+    }
+  }
+  const storage = createFakeStorageDomain({ workspaceRecords, cacheIds: [id], archived: [id] })
+  const originalGet = ctx.get
+  ctx.get = (name) => {
+    if (name === 'sessionPersistence') return { supportsRawArtifacts: true, locate: () => ({ kind: 'jsonl', path: sourcePath }) }
+    if (name === 'storageDomain') return storage
+    return originalGet(name)
+  }
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id, createdAt: 1, version: 0, cwd: '/workspace', origin: 'default' }, live: false, persisted: true }
+  ]
+  ctx.sessionQuery.readTitleSnapshots = async () => [
+    { sessionId: id, status: 'fulfilled', value: { title: { title: 'Moved' } } }
+  ]
+  ctx.workspaceRegistry.list = () => [workspace]
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = [id]
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'delete', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.equal(result.json.cleanup.ok, true)
+  assert.equal(await accessPromise(sourcePath).then(() => true, () => false), false)
+  assert.deepEqual(detached, [id])
+  assert.deepEqual(workspaceRecords.ws.sessionIds, [])
+  assert.equal(storage.cacheIds.has(id), false)
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [])
+  const trash = JSON.parse(readFileSync(join(testHome, 'profiles', '.session-manager-custom-trash', 'trash.json'), 'utf8'))
+  assert.ok(trash.some((item) => item.id === id))
+})
+
+test('moving a session to backup detaches workspace, archive marker and projection cache', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-backup-move'
+  const sessionDir = join(testHome, 'sessions', id)
+  const sourcePath = join(sessionDir, 'session.jsonl')
+  mkdirSync(sessionDir, { recursive: true })
+  writeFileSync(sourcePath, `${JSON.stringify({ type: 'session', version: 0, id, createdAt: 1, cwd: '/workspace', delegationDepth: 0 })}\n`)
+  const workspaceRecords = { ws: { id: 'ws', path: '/workspace', sessionIds: [id] } }
+  const workspace = {
+    id: 'ws',
+    title: 'Workspace',
+    path: '/workspace',
+    sessionIds: [id],
+    detachSession: async (sessionId) => {
+      workspaceRecords.ws.sessionIds = workspaceRecords.ws.sessionIds.filter((item) => item !== sessionId)
+      workspace.sessionIds = workspaceRecords.ws.sessionIds
+    }
+  }
+  const storage = createFakeStorageDomain({ workspaceRecords, cacheIds: [id], archived: [id] })
+  const originalGet = ctx.get
+  ctx.get = (name) => {
+    if (name === 'sessionPersistence') return { supportsRawArtifacts: true, locate: () => ({ kind: 'jsonl', path: sourcePath }) }
+    if (name === 'storageDomain') return storage
+    return originalGet(name)
+  }
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id, createdAt: 1, version: 0, cwd: '/workspace', origin: 'default' }, live: false, persisted: true }
+  ]
+  ctx.sessionQuery.readTitleSnapshots = async () => []
+  ctx.workspaceRegistry.list = () => [workspace]
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = [id]
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'backup', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.equal(result.json.cleanup.ok, true)
+  assert.deepEqual(workspaceRecords.ws.sessionIds, [])
+  assert.equal(storage.cacheIds.has(id), false)
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [])
+  const backup = JSON.parse(readFileSync(join(testHome, 'profiles', '.session-manager-custom-backup', 'backup.json'), 'utf8'))
+  assert.ok(backup.some((item) => item.id === id))
+})
+
+test('purging a trash session removes its manifest, workspace reference and projection cache', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-purge'
+  const areaRoot = join(testHome, 'profiles', '.session-manager-custom-trash')
+  const storageDir = join(areaRoot, id)
+  const originalPath = join(testHome, 'sessions', id, 'session.jsonl')
+  mkdirSync(storageDir, { recursive: true })
+  writeFileSync(join(storageDir, 'session.jsonl'), '{}')
+  writeFileSync(join(areaRoot, 'trash.json'), JSON.stringify([
+    { id, title: 'Purge', cwd: '/workspace', createdAt: 1, trashedAt: 2, originalPath }
+  ], null, 2))
+  const workspaceRecords = { ws: { id: 'ws', path: '/workspace', sessionIds: [id] } }
+  const detached = []
+  const workspace = {
+    id: 'ws',
+    sessionIds: [id],
+    detachSession: async (sessionId) => {
+      detached.push(sessionId)
+      workspaceRecords.ws.sessionIds = workspaceRecords.ws.sessionIds.filter((item) => item !== sessionId)
+      workspace.sessionIds = workspaceRecords.ws.sessionIds
+    }
+  }
+  const storage = createFakeStorageDomain({ workspaceRecords, cacheIds: [id], archived: [id] })
+  const originalGet = ctx.get
+  ctx.get = (name) => name === 'storageDomain' ? storage : originalGet(name)
+  ctx.workspaceRegistry.list = () => []
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = [id]
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'trashPurge', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.equal(result.json.cleanup.ok, true)
+  assert.equal(await accessPromise(join(storageDir, 'session.jsonl')).then(() => true, () => false), false)
+  assert.deepEqual(detached, [id])
+  assert.deepEqual(workspaceRecords.ws.sessionIds, [])
+  assert.equal(storage.cacheIds.has(id), false)
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [])
+  assert.deepEqual(JSON.parse(readFileSync(join(areaRoot, 'trash.json'), 'utf8')), [])
+})
+
+test('restoring a backup session reattaches workspace, archive state and projection cache', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-restore'
+  const areaRoot = join(testHome, 'profiles', '.session-manager-custom-backup')
+  const storageDir = join(areaRoot, id)
+  const originalPath = join(testHome, 'sessions', id, 'session.jsonl')
+  mkdirSync(storageDir, { recursive: true })
+  writeFileSync(join(storageDir, 'session.jsonl'), `${JSON.stringify({ type: 'session', version: 0, id, createdAt: 1, cwd: '/workspace', delegationDepth: 0 })}\n`)
+  writeFileSync(join(areaRoot, 'backup.json'), JSON.stringify([
+    { id, title: 'Restore', cwd: '/workspace', workspace: { id: 'ws', title: 'Workspace', path: '/workspace' }, createdAt: 1, backedUpAt: 2, wasArchived: true, originalPath }
+  ], null, 2))
+  let attached = false
+  const workspace = {
+    id: 'ws',
+    sessionIds: [],
+    attachSession: async (sessionId) => {
+      attached = true
+      workspace.sessionIds = [sessionId]
+    }
+  }
+  const storage = createFakeStorageDomain({ cacheIds: [id], archived: [] })
+  const cacheService = {
+    coldSnapshot: async (sessionId) => {
+      storage.cacheIds.add(sessionId)
+    }
+  }
+  const originalGet = ctx.get
+  ctx.get = (name) => {
+    if (name === 'sessionProjectionCache') return cacheService
+    if (name === 'storageDomain') return storage
+    return originalGet(name)
+  }
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id, createdAt: 1, cwd: '/workspace', origin: 'default' }, live: false, persisted: true }
+  ]
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.resolveByPath = async () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = []
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'backupRestore', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.equal(attached, true)
+  assert.equal(result.json.archived, true)
+  assert.deepEqual(workspace.sessionIds, [id])
+  assert.equal(storage.cacheIds.has(id), true)
+  assert.equal(result.json.cacheRefresh.action, 'refreshed')
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [id])
+  assert.deepEqual(JSON.parse(readFileSync(join(areaRoot, 'backup.json'), 'utf8')), [])
+})
+
+test('restoring a trash session reattaches workspace, archive state and projection cache', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-trash-restore'
+  const areaRoot = join(testHome, 'profiles', '.session-manager-custom-trash')
+  const storageDir = join(areaRoot, id)
+  const originalPath = join(testHome, 'sessions', id, 'session.jsonl')
+  mkdirSync(storageDir, { recursive: true })
+  writeFileSync(join(storageDir, 'session.jsonl'), `${JSON.stringify({ type: 'session', version: 0, id, createdAt: 1, cwd: '/workspace', delegationDepth: 0 })}\n`)
+  writeFileSync(join(areaRoot, 'trash.json'), JSON.stringify([
+    { id, title: 'Restore trash', cwd: '/workspace', workspace: { id: 'ws', title: 'Workspace', path: '/workspace' }, createdAt: 1, trashedAt: 2, originalPath }
+  ], null, 2))
+  let attached = false
+  const workspace = {
+    id: 'ws',
+    sessionIds: [],
+    attachSession: async (sessionId) => {
+      attached = true
+      workspace.sessionIds = [sessionId]
+    }
+  }
+  const storage = createFakeStorageDomain({ cacheIds: [id], archived: [] })
+  const cacheService = {
+    coldSnapshot: async (sessionId) => {
+      storage.cacheIds.add(sessionId)
+    }
+  }
+  const originalGet = ctx.get
+  ctx.get = (name) => {
+    if (name === 'sessionProjectionCache') return cacheService
+    if (name === 'storageDomain') return storage
+    return originalGet(name)
+  }
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id, createdAt: 1, cwd: '/workspace', origin: 'default' }, live: false, persisted: true }
+  ]
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.resolveByPath = async () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = []
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'trashRestore', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.equal(attached, true)
+  assert.equal(result.json.archived, true)
+  assert.deepEqual(workspace.sessionIds, [id])
+  assert.equal(storage.cacheIds.has(id), true)
+  assert.equal(result.json.cacheRefresh.action, 'refreshed')
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [id])
+  assert.deepEqual(JSON.parse(readFileSync(join(areaRoot, 'trash.json'), 'utf8')), [])
+})
+
+test('moving a normal session clears old workspace references before attaching the target', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-workspace-move'
+  const workspaceRecords = {
+    old: { id: 'old', path: '/old', sessionIds: [id] },
+    target: { id: 'target', path: '/target', sessionIds: [] }
+  }
+  const workspaces = {
+    old: {
+      id: 'old',
+      path: '/old',
+      sessionIds: [id],
+      detachSession: async (sessionId) => {
+        workspaceRecords.old.sessionIds = workspaceRecords.old.sessionIds.filter((item) => item !== sessionId)
+        workspaces.old.sessionIds = workspaceRecords.old.sessionIds
+      }
+    },
+    target: {
+      id: 'target',
+      path: '/target',
+      sessionIds: [],
+      attachSession: async (sessionId) => {
+        workspaceRecords.target.sessionIds = [sessionId]
+        workspaces.target.sessionIds = workspaceRecords.target.sessionIds
+      }
+    }
+  }
+  const storage = createFakeStorageDomain({ workspaceRecords })
+  const originalGet = ctx.get
+  ctx.get = (name) => name === 'storageDomain' ? storage : originalGet(name)
+  ctx.workspaceRegistry.list = () => Object.values(workspaces)
+  ctx.workspaceRegistry.get = (id) => workspaces[id]
+
+  const result = await invoke(route, { method: 'move', args: { id, workspaceId: 'target' } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.deepEqual(result.json.detach.detached, ['old'])
+  assert.deepEqual(workspaceRecords.old.sessionIds, [])
+  assert.deepEqual(workspaceRecords.target.sessionIds, [id])
+})
+
+test('restoring a normal session reattaches workspace and clears archive marker', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-normal-restore'
+  const workspaceRecords = { ws: { id: 'ws', path: '/workspace', sessionIds: [] } }
+  const workspace = {
+    id: 'ws',
+    path: '/workspace',
+    sessionIds: [],
+    attachSession: async (sessionId) => {
+      workspaceRecords.ws.sessionIds = [sessionId]
+      workspace.sessionIds = workspaceRecords.ws.sessionIds
+    }
+  }
+  const storage = createFakeStorageDomain({ workspaceRecords, archived: [id] })
+  const originalGet = ctx.get
+  ctx.get = (name) => name === 'storageDomain' ? storage : originalGet(name)
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id, createdAt: 1, cwd: '/workspace', origin: 'default' }, live: false, persisted: true }
+  ]
+  ctx.workspaceRegistry.list = () => [workspace]
+  ctx.workspaceRegistry.get = () => workspace
+  ctx.workspaceRegistry.resolveByPath = async () => workspace
+  ctx.workspaceRegistry.archivedSessionIds = [id]
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'restore', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, true)
+  assert.deepEqual(workspaceRecords.ws.sessionIds, [id])
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [])
+})
+
+test('restore rolls back to storage when workspace reattachment fails', async () => {
+  const { ctx, route } = createContext()
+  const id = 'session-restore-rollback'
+  const areaRoot = join(testHome, 'profiles', '.session-manager-custom-backup')
+  const storageDir = join(areaRoot, id)
+  const originalPath = join(testHome, 'sessions', id, 'session.jsonl')
+  mkdirSync(storageDir, { recursive: true })
+  writeFileSync(join(storageDir, 'session.jsonl'), `${JSON.stringify({ type: 'session', version: 0, id, createdAt: 1, cwd: '/missing', delegationDepth: 0 })}\n`)
+  writeFileSync(join(areaRoot, 'backup.json'), JSON.stringify([
+    { id, title: 'Rollback', cwd: '/missing', createdAt: 1, backedUpAt: 2, wasArchived: true, originalPath }
+  ], null, 2))
+  const storage = createFakeStorageDomain({ cacheIds: [id], archived: [id] })
+  const originalGet = ctx.get
+  ctx.get = (name) => name === 'storageDomain' ? storage : originalGet(name)
+  ctx.sessionQuery.listSessions = async () => [
+    { header: { id, createdAt: 1, cwd: '/missing', origin: 'default' }, live: false, persisted: true }
+  ]
+  ctx.workspaceRegistry.resolveByPath = async () => undefined
+  ctx.workspaceRegistry.get = () => undefined
+  ctx.workspaceRegistry.archivedSessionIds = [id]
+  ctx.workspaceRegistry.setState = async (state) => {
+    ctx.workspaceRegistry.archivedSessionIds = state.archivedSessionIds
+    storage.workspaceState.archivedSessionIds = [...state.archivedSessionIds]
+  }
+
+  const result = await invoke(route, { method: 'backupRestore', args: { id } })
+
+  assert.equal(result.status, 200)
+  assert.equal(result.json.ok, false)
+  assert.equal(result.json.rollback.ok, true)
+  assert.equal(await accessPromise(originalPath).then(() => true, () => false), false)
+  assert.equal(await accessPromise(join(storageDir, 'session.jsonl')).then(() => true, () => false), true)
+  assert.ok(JSON.parse(readFileSync(join(areaRoot, 'backup.json'), 'utf8')).some((item) => item.id === id))
+  assert.equal(storage.cacheIds.has(id), false)
+  assert.deepEqual(storage.workspaceState.archivedSessionIds, [])
 })

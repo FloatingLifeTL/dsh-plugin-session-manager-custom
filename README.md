@@ -2,7 +2,7 @@
 
 DeepSeek Harness Web 插件，用于查看、预览和管理本机会话数据。
 
-- 当前版本：`0.5.0`
+- 当前版本：`0.5.1`
 - DSH 开发基线：`0.1.0-rc.7`；当前上游 `master` 尚待真实 Web 集成复核
 - 平台范围：Windows
 - 状态：developer preview，接口可能变化
@@ -15,24 +15,25 @@ DeepSeek Harness Web 插件，用于查看、预览和管理本机会话数据�
 | 插件 ID | `session-manager-custom` |
 | npm/package 名 | `@dsh-local/session-manager-custom` |
 | GitHub 仓库名 | `dsh-plugin-session-manager-custom` |
-| GitHub 安装命令 | `dsh plugin --profile web add github:FloatingLifeTL/dsh-plugin-session-manager-custom#v0.5.0` |
+| GitHub 安装命令 | `dsh plugin --profile web add github:FloatingLifeTL/dsh-plugin-session-manager-custom#v0.5.1` |
 
 ## 功能概要
 
 - 在设置按钮右侧显示 `会话管理器` 悬浮入口。
 - 查看全部、未归档、归档、异常、子代理、备份区和回收站会话。
 - 子代理会话不会因未挂到主工作区而被误判为未分组异常。
-- 支持归档、恢复、移动工作区、修复未分组和批量操作。
+- 支持归档、恢复、移动工作区、修复未分组、清理无效索引和批量操作。
+- 移入备份区或回收站时会同步移除工作区引用、归档标记和投影缓存；恢复时重新关联工作区并立即重建缓存。
 - 支持备份区、回收站只读预览。
 - 支持搜索、复选框、右侧只读预览和宽度调整。
 - 所有会话数据保留在本机 DSH profile 中。
 
-详细的视图分类、数据状态、生命周期和安全边界见 [项目说明](./docs/project.md)。
+详细的视图分类、数据状态、生命周期和安全边界见 [项目说明](./docs/project.md)，更新说明见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 安装
 
 ```powershell
-dsh plugin --profile web add github:FloatingLifeTL/dsh-plugin-session-manager-custom#v0.5.0
+dsh plugin --profile web add github:FloatingLifeTL/dsh-plugin-session-manager-custom#v0.5.1
 ```
 
 安装要求：
@@ -44,7 +45,7 @@ dsh plugin --profile web add github:FloatingLifeTL/dsh-plugin-session-manager-cu
 
 安装完成后需要重启 DSH 并刷新 Web 页面。
 
-升级说明：命令中的 `#v0.5.0` 指向本次发布版本的 tag。后续发布新版本后，把 tag 改成新版（例如 `#v0.6.0`）再执行一次，即可更新到对应版本；若希望始终以本地源码为准，可改用 [本地安装或更新](#本地安装或更新)。
+升级说明：命令中的 `#v0.5.1` 指向本次发布版本的 tag。后续发布新版本后，把 tag 改成新版对应值再执行一次，即可更新到对应版本；若希望始终以本地源码为准，可改用 [本地安装或更新](#本地安装或更新)。
 
 ## 本地安装或更新
 
@@ -81,6 +82,7 @@ dsh-plugin-session-manager-custom/
 ├─ docs/
 │  └─ project.md
 ├─ README.md
+├─ CHANGELOG.md
 ├─ CONTRIBUTING.md
 ├─ SECURITY.md
 ├─ THIRD_PARTY_NOTICES.md

@@ -84,6 +84,8 @@ window.__ModuleLoader__.load({
 
 .dsh-session-manager-custom-title{font-size:16px;font-weight:700;color:var(--dsw-alias-label-primary)}
 
+.dsh-session-manager-custom-version{margin-left:6px;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500}
+
 .dsh-session-manager-custom-id-badge{width:100%;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.5;opacity:.9}
 
 .dsh-session-manager-custom-close{position:absolute;top:14px;right:16px;width:30px;height:30px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:18px;cursor:pointer}
@@ -288,6 +290,7 @@ body.dsh-session-manager-custom-resizing{cursor:col-resize;user-select:none}
         const [items, setItems] = React.useState([])
         const [counts, setCounts] = React.useState(EMPTY_COUNTS)
         const [workspaces, setWorkspaces] = React.useState([])
+        const [pluginVersion, setPluginVersion] = React.useState('')
         const [loading, setLoading] = React.useState(false)
         const [error, setError] = React.useState('')
         const [selected, setSelected] = React.useState(null)
@@ -304,6 +307,18 @@ body.dsh-session-manager-custom-resizing{cursor:col-resize;user-select:none}
         const resizeCleanupRef = React.useRef(null)
         const detailRequestRef = React.useRef(0)
         const listRequestRef = React.useRef(0)
+
+        // 从 Host 的真实 package.json 版本声明读取，不在 Client 中硬编码。
+        React.useEffect(() => {
+          if (!value || pluginVersion) return
+          let active = true
+          call('version').then((result) => {
+            if (active && result.version) setPluginVersion(String(result.version))
+          }).catch(() => {})
+          return () => {
+            active = false
+          }
+        }, [value, pluginVersion])
 
         // 打开期间监听 Escape；关闭或卸载时移除全局 keydown 监听。
         React.useEffect(() => {
@@ -481,6 +496,21 @@ body.dsh-session-manager-custom-resizing{cursor:col-resize;user-select:none}
           }
         })
 
+        /** 删除 sessionQuery 已不可见会话的派生索引，并在完成后刷新列表。 */
+        const runCleanup = () => runAction({
+          method: 'cleanup',
+          args: {},
+          loading: true,
+          afterSuccess: async (result) => {
+            const cacheCount = (result.removedCacheIds || []).length
+            const workspaceCount = (result.removedWorkspace || []).length
+            const archiveCount = (result.removedArchiveIds || []).length
+            const skippedCount = (result.skipped || []).length
+            setNotice(`已清理 ${cacheCount} 条缓存、${workspaceCount} 条工作区引用${archiveCount ? `、${archiveCount} 条归档标记` : ''}${skippedCount ? `，跳过 ${skippedCount} 项` : ''}`)
+            await load()
+          }
+        })
+
         /** 归档普通会话并保留刷新后的右侧详情焦点。 */
         const runArchive = (item) => runAction({
           method: 'archive',
@@ -627,9 +657,12 @@ body.dsh-session-manager-custom-resizing{cursor:col-resize;user-select:none}
           },
             // 顶栏包含标题、关闭按钮和稳定的插件身份标记。
             el('div', { className: 'dsh-session-manager-custom-header' },
-              el('div', { className: 'dsh-session-manager-custom-title' }, '会话数据管理'),
+              el('div', { className: 'dsh-session-manager-custom-title' },
+                '会话管理器',
+                pluginVersion ? el('span', { className: 'dsh-session-manager-custom-version' }, `v${pluginVersion}`) : null
+              ),
               el('button', { className: 'dsh-session-manager-custom-close', title: '关闭', onClick: () => setOpen(false) }, '×'),
-              el('div', { className: 'dsh-session-manager-custom-id-badge' }, '「会话管理器_插件ID："session-manager-custom"」')
+              el('div', { className: 'dsh-session-manager-custom-id-badge' }, '「插件ID："session-manager-custom"」')
             ),
             // 工具栏集中渲染视图 Tab、搜索和全局修复/刷新操作。
             el('div', { className: 'dsh-session-manager-custom-toolbar' },
@@ -646,6 +679,7 @@ body.dsh-session-manager-custom-resizing{cursor:col-resize;user-select:none}
                 el('button', { className: 'dsh-session-manager-custom-button', onClick: () => setQuery(queryInput) }, '搜索')
               ),
               el('button', { className: 'dsh-session-manager-custom-button', onClick: () => runRepair() }, '修复未分组'),
+              el('button', { className: 'dsh-session-manager-custom-button', onClick: () => runCleanup() }, '清理无效索引'),
               el('button', { className: 'dsh-session-manager-custom-button', onClick: () => load() }, loading ? '加载中' : '刷新')
             ),
             // 只有选中复选框后才显示批量操作栏。

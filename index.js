@@ -2,12 +2,20 @@
 // 提供会话列表、详情、归档/恢复、工作区修复，以及回收站和备份保留区的持久化管理。
 // 回收站与备份保留区共享同一套“移动、恢复、彻底删除”生命周期，避免两套实现漂移。
 import { promises as fs } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
+/** 从 Host 安装包读取版本声明，Client 不单独维护版本字符串。 */
+const requireFromPackage = createRequire(import.meta.url)
+const { version: pluginVersion } = requireFromPackage('./package.json')
+
 /** Cordis 插件标识；Dsh 通过 package 中的 name 加载 Host apply。 */
 export const name = 'session-manager-custom'
+
+/** Host 插件版本，来源于同目录 package.json。 */
+export const version = pluginVersion
 
 /** Host 必需依赖。缺少任一服务时 Cordis 会等待服务出现后再应用插件。 */
 export const inject = ['webServer', 'workspaceRegistry', 'sessionQuery']
@@ -302,32 +310,49 @@ export function apply(ctx) {
     : false
 
   /**
-   * 统一更新工作区归档列表。优先使用 registry.setState；旧版只有 storageDomain
-   * handle 时，则回退到直接写 global state 和 registry.state。
+   * 统一更新工作区归档列表。优先通过 registry 的串行操作队列，避免和归档、
+   * 恢复等 registry mutation 交错；旧版没有队列时回退到 registry.setState。
    */
   const setArchivedSessionState = async (sessionId, archived) => {
     const reg = ctx.workspaceRegistry
     const domain = ctx.get('storageDomain')
-    if (!domain) return false
+    if (!domain) return { ok: false, action: 'archived', error: '工作区存储领域不可用' }
     const handle = domain.get('workspace')
-    if (!handle) return false
-    const current = handle.global.get()
-    if (!current || !Array.isArray(current.archivedSessionIds)) return false
-    const isArchived = current.archivedSessionIds.includes(sessionId)
-    if (isArchived === archived) return true
-    const next = {
-      ...current,
-      archivedSessionIds: archived
-        ? [...current.archivedSessionIds, sessionId]
-        : current.archivedSessionIds.filter((id) => id !== sessionId)
+    if (!handle || !handle.global) return { ok: false, action: 'archived', error: '工作区全局状态不可用' }
+    const apply = async () => {
+      const current = handle.global.get()
+      if (!current || !Array.isArray(current.archivedSessionIds)) {
+        return { ok: false, action: 'archived', error: '工作区归档状态格式无效' }
+      }
+      const wasArchived = current.archivedSessionIds.includes(sessionId)
+      if (wasArchived === archived) {
+        return { ok: true, action: 'unchanged', changed: false, archived }
+      }
+      const next = {
+        ...current,
+        archivedSessionIds: archived
+          ? [...current.archivedSessionIds, sessionId]
+          : current.archivedSessionIds.filter((id) => id !== sessionId)
+      }
+      try {
+        if (typeof reg.setState === 'function') {
+          await reg.setState(next)
+        } else {
+          await handle.global.set(next)
+          reg.state = next
+        }
+        return { ok: true, action: archived ? 'archived' : 'unarchived', changed: true, archived }
+      } catch (error) {
+        return { ok: false, action: 'archived', error: errText(error) }
+      }
     }
-    if (typeof reg.setState === 'function') {
-      await reg.setState(next)
-    } else {
-      await handle.global.set(next)
-      reg.state = next
+    try {
+      return typeof reg.enqueueOperation === 'function'
+        ? await reg.enqueueOperation(apply)
+        : await apply()
+    } catch (error) {
+      return { ok: false, action: 'archived', error: errText(error) }
     }
-    return true
   }
 
   /** 将工作区对象裁剪为可安全通过 JSON API 返回的最小视图。 */
@@ -335,10 +360,124 @@ export function apply(ctx) {
     ? { id: workspace.id, title: workspace.title, path: workspace.path }
     : null
 
+  /** 返回工作区持久化表；旧运行时未暴露 storageDomain 时返回 undefined。 */
+  const workspaceDomainTable = () => {
+    const domain = ctx.get('storageDomain')
+    return domain && typeof domain.get === 'function'
+      ? domain.get('workspace')?.table('workspaces')
+      : undefined
+  }
+
+  /** 返回会话投影缓存表；该缓存不是权威日志，清理后可从持久化日志重建。 */
+  const projectionCacheDomainTable = () => {
+    const domain = ctx.get('storageDomain')
+    return domain && typeof domain.get === 'function'
+      ? domain.get('session_projcache')?.table('sessions')
+      : undefined
+  }
+
+  /**
+   * 查找会话的全部工作区实体。workspaceRegistry.list() 的 sessionIds 会过滤掉
+   * 没有持久化 header 的旧引用，因此还要对照持久化工作区表找到悬空引用实体。
+   */
+  const workspaceEntitiesForSession = (id) => {
+    const entities = new Map()
+    for (const workspace of ctx.workspaceRegistry.list()) {
+      if (workspace.sessionIds.includes(id)) entities.set(workspace.id, workspace)
+    }
+    const table = workspaceDomainTable()
+    if (table && typeof table.entries === 'function') {
+      for (const [workspaceId, record] of [...table.entries()]) {
+        if (!Array.isArray(record.sessionIds) || !record.sessionIds.includes(id)) continue
+        const entity = ctx.workspaceRegistry.get(workspaceId)
+        if (entity) entities.set(workspaceId, entity)
+      }
+    }
+    return [...entities.values()]
+  }
+
   /** 根据会话 id 查找其当前所属工作区。 */
-  const workspaceViewForSession = (id) => {
-    const workspace = ctx.workspaceRegistry.list().find((ws) => ws.sessionIds.includes(id))
-    return toWorkspaceView(workspace)
+  const workspaceEntityForSession = (id) => workspaceEntitiesForSession(id)[0]
+
+  /** 根据会话 id 查找其当前所属工作区。 */
+  const workspaceViewForSession = (id) => toWorkspaceView(workspaceEntityForSession(id))
+
+  /**
+   * 从所有工作区持久化记录中移除一个会话。WS 记录可能因历史问题重复归属，
+   * 因此逐个清理而不是只处理第一个可见工作区。
+   */
+  const detachWorkspaceSession = async (id) => {
+    const workspaces = workspaceEntitiesForSession(id)
+    if (workspaces.length === 0) return { ok: true, action: 'not-attached' }
+    const detached = []
+    const failures = []
+    for (const workspace of workspaces) {
+      if (typeof workspace.detachSession !== 'function') {
+        failures.push({ workspaceId: workspace.id, error: '工作区实体不支持 detachSession' })
+        continue
+      }
+      try {
+        await workspace.detachSession(id)
+        detached.push(workspace.id)
+      } catch (error) {
+        failures.push({ workspaceId: workspace.id, error: errText(error) })
+      }
+    }
+    return {
+      ok: failures.length === 0,
+      action: detached.length ? 'detached' : 'not-attached',
+      detached,
+      failures
+    }
+  }
+
+  /** 删除一个会话的投影缓存；缓存不存在时视为成功。 */
+  const deleteProjectionCache = async (id) => {
+    const table = projectionCacheDomainTable()
+    if (!table || typeof table.delete !== 'function') {
+      return { ok: false, action: 'cached', error: '投影缓存领域不可用' }
+    }
+    try {
+      const exists = typeof table.get === 'function' ? table.get(id) : undefined
+      if (exists === undefined) return { ok: true, action: 'not-cached' }
+      await table.delete(id)
+      return { ok: true, action: 'deleted' }
+    } catch (error) {
+      return { ok: false, action: 'cached', error: errText(error) }
+    }
+  }
+
+  /**
+   * 恢复后立刻冷读并写回投影缓存。缓存只是派生数据，因此冷读或缓存服务缺失时
+   * 允许退化到“后续访问时重建”，但不会把当前仍存在的旧缓存误报为已重建。
+   */
+  const refreshProjectionCache = async (id) => {
+    const service = ctx.get('sessionProjectionCache')
+    if (service && typeof service.coldSnapshot === 'function') {
+      try {
+        await service.coldSnapshot(id)
+        const table = projectionCacheDomainTable()
+        const exists = table && typeof table.get === 'function' ? table.get(id) !== undefined : false
+        return exists
+          ? { ok: true, action: 'refreshed' }
+          : { ok: false, action: 'cached', error: '投影缓存未完成写回' }
+      } catch (error) {
+        return { ok: false, action: 'cached', error: errText(error) }
+      }
+    }
+    return { ok: true, action: 'lazy', error: '会话投影缓存服务不可用，将在下次冷读时重建' }
+  }
+
+  /**
+   * 清理单个会话的工作区引用、归档标记和投影缓存。
+   * 任一项失败都会使整体返回失败，调用方不得把该状态当成同步成功。
+   */
+  const cleanupSessionIndex = async (id) => {
+    const workspace = await detachWorkspaceSession(id)
+    const cache = await deleteProjectionCache(id)
+    const archive = await setArchivedSessionState(id, false)
+    const errors = [workspace, cache, archive].filter((item) => item && item.ok === false)
+    return { ok: errors.length === 0, workspace, cache, archive, errors }
   }
 
   /** 从 sessionQuery 的 live-preferred 列表中按 id 查找记录。 */
@@ -447,35 +586,85 @@ export function apply(ctx) {
 
     // 原目录已经搬空，删除失败不阻塞本次操作；会话已由清单完整追踪。
     await fs.rmdir(dirname(location.path)).catch(() => {})
-    if (isArchivedSession(id)) {
-      try {
-        await setArchivedSessionState(id, false)
-      } catch (_) {}
-    }
+    const cleanup = await cleanupSessionIndex(id)
 
     return {
-      ok: true,
+      ok: Boolean(cleanup.ok),
       id,
       trashed: area.kind === 'trash',
       backedUp: area.kind === 'backup',
       path: storagePath,
-      originalPath: location.path
+      originalPath: location.path,
+      cleanup,
+      error: cleanup.ok ? undefined : '会话移入保留区后，工作区或派生索引同步失败'
     }
   }
 
-  /** 根据会话记录的 cwd 重新关联工作区，保证恢复文件后仍显示在原来的分组。 */
-  const reattachSessionWorkspace = async (id) => {
+  /** 把会话附加到一个工作区；失败结果统一为 API 可读对象。 */
+  const attachSessionWorkspace = async (workspace, id) => {
+    if (!workspace || typeof workspace.attachSession !== 'function') {
+      return { ok: false, error: '工作区实体不可用' }
+    }
+    try {
+      await workspace.attachSession(id)
+      return { ok: true, workspaceId: workspace.id }
+    } catch (error) {
+      return { ok: false, workspaceId: workspace.id, error: errText(error) }
+    }
+  }
+
+  /** 在移动失败补偿时，重新恢复此前捕获的工作区关联。 */
+  const restoreWorkspaceMemberships = async (id, workspaces) => {
+    const restored = []
+    const failures = []
+    for (const workspace of workspaces) {
+      const result = await attachSessionWorkspace(workspace, id)
+      if (result.ok) restored.push(workspace.id)
+      else failures.push(result)
+    }
+    return { ok: failures.length === 0, restored, failures }
+  }
+
+  /** 根据会话记录或保留区清单的 cwd 重新关联工作区。 */
+  const reattachSessionWorkspace = async (id, entry) => {
     const records = await ctx.sessionQuery.listSessions().catch(() => [])
     const record = records.find((item) => item.header && item.header.id === id)
-    if (record && record.header.cwd) {
-      const workspace = await ctx.workspaceRegistry.resolveByPath(record.header.cwd).catch(() => undefined)
-      if (workspace) await workspace.attachSession(id)
+    const entryWorkspace = entry && entry.workspace
+    let workspace = entryWorkspace && entryWorkspace.id
+      ? ctx.workspaceRegistry.get(entryWorkspace.id)
+      : undefined
+    if (!workspace) {
+      const cwd = (entry && entry.cwd) || (record && record.header.cwd)
+      if (cwd) workspace = await ctx.workspaceRegistry.resolveByPath(cwd).catch(() => undefined)
+    }
+    if (!workspace) return { ok: false, error: '无法解析所属工作区' }
+    return attachSessionWorkspace(workspace, id)
+  }
+
+  /**
+   * 恢复后的任一项索引同步失败时，把文件送回保留区并恢复清单。
+   * 这里不做“文件已恢复但工作区/缓存失败”的部分成功，避免把不一致状态交给 UI。
+   */
+  const rollbackRestoreStorageSession = async ({ id, area, entry, entries }) => {
+    const destination = join(area.root, id, basename(entry.originalPath || ''))
+    // 保留区目录在源文件搬走后通常已空，仍先确保目录存在。
+    await fs.mkdir(dirname(destination), { recursive: true })
+    if (await pathExists(destination)) {
+      return { ok: false, error: '回滚失败：保留区目标文件已存在' }
+    }
+    try {
+      await fs.rename(entry.originalPath, destination)
+      await writeManifest(area.manifestPath, entries)
+      const cleanup = await cleanupSessionIndex(id)
+      return { ok: cleanup.ok, cleanup }
+    } catch (error) {
+      return { ok: false, error: errText(error) }
     }
   }
 
   /**
-   * 恢复会话时先写剩余清单，再移动文件。文件移动失败会回滚清单，
-   * 避免清单误以为会话已经恢复而实际文件仍留在保留区。
+   * 恢复会话时先写剩余清单，再移动文件。文件移动失败会回滚清单；
+   * 后续索引同步失败则把文件送回保留区，避免出现“文件已恢复但索引不一致”。
    */
   const restoreFromStorageSession = async (id, area) => {
     const entries = await readManifest(area.manifestPath)
@@ -497,10 +686,41 @@ export function apply(ctx) {
       throw error
     }
 
+    const workspaceAttach = await reattachSessionWorkspace(id, entry)
+    const cacheCleanup = await deleteProjectionCache(id)
+    const archiveState = await setArchivedSessionState(id, area.restoreArchived(entry))
+    const cacheRefresh = await refreshProjectionCache(id)
+    const ok = Boolean(
+      workspaceAttach.ok &&
+      cacheCleanup.ok &&
+      archiveState.ok &&
+      cacheRefresh.ok
+    )
+    if (!ok) {
+      const rollback = await rollbackRestoreStorageSession({ id, area, entry, entries })
+      return {
+        ok: false,
+        id,
+        error: '会话恢复后工作区或派生索引同步失败，已尝试送回保留区',
+        workspaceAttach,
+        cacheCleanup,
+        archiveState,
+        cacheRefresh,
+        rollback
+      }
+    }
+
     await fs.rmdir(join(area.root, id)).catch(() => {})
-    await reattachSessionWorkspace(id)
-    const archived = await setArchivedSessionState(id, area.restoreArchived(entry))
-    return { ok: true, id, archived: Boolean(archived), path: entry.originalPath }
+    return {
+      ok: true,
+      id,
+      archived: Boolean(archiveState.archived),
+      path: entry.originalPath,
+      workspaceAttach,
+      cacheCleanup,
+      archiveState,
+      cacheRefresh
+    }
   }
 
   /**
@@ -518,7 +738,13 @@ export function apply(ctx) {
       await writeManifest(area.manifestPath, entries).catch(() => {})
       throw error
     }
-    return { ok: true, id }
+    const cleanup = await cleanupSessionIndex(id)
+    return {
+      ok: Boolean(cleanup.ok),
+      id,
+      cleanup,
+      error: cleanup.ok ? undefined : '彻底删除后，工作区或派生索引同步失败'
+    }
   }
 
   /** 把保留区清单项转换成 API item，并按各自 movedAt 字段排序、按搜索词过滤。 */
@@ -599,6 +825,7 @@ export function apply(ctx) {
   }
 
   /** 把一个未分组会话显式关联到用户选择的工作区。 */
+  /** 把普通会话显式移动到一个工作区，并清除其他旧工作区引用。 */
   const moveSession = async (args) => {
     const id = String((args && args.id) || '')
     const workspaceId = String((args && args.workspaceId) || '')
@@ -606,24 +833,45 @@ export function apply(ctx) {
     if (!workspaceId) return { ok: false, error: '请选择工作区' }
     const workspace = ctx.workspaceRegistry.get(workspaceId)
     if (!workspace) return { ok: false, error: '工作区不存在' }
-    try {
-      await workspace.attachSession(id)
-      return { ok: true, id, workspaceId }
-    } catch (error) {
-      return { ok: false, error: errText(error) }
+
+    const current = workspaceEntitiesForSession(id)
+    if (current.length > 0 && current.every((item) => item.id === workspaceId)) {
+      return { ok: true, id, workspaceId, action: 'already-moved' }
     }
+    const detach = await detachWorkspaceSession(id)
+    if (!detach.ok) return { ok: false, error: '清除旧工作区引用失败', detach }
+
+    const attached = await attachSessionWorkspace(workspace, id)
+    if (!attached.ok) {
+      const rollback = await restoreWorkspaceMemberships(id, current)
+      return {
+        ok: false,
+        error: `移动到工作区失败: ${attached.error}`,
+        attached,
+        rollback
+      }
+    }
+    return { ok: true, id, workspaceId, action: 'moved', detach, attached }
   }
 
   /** 将普通会话从归档状态恢复，并重新关联其记录中的工作区。 */
   const restoreSession = async (id) => {
-    try {
-      const restored = await setArchivedSessionState(id, false)
-      if (!restored) return { ok: false, error: '无法访问工作区归档状态' }
-      await reattachSessionWorkspace(id)
-      return { ok: true, id }
-    } catch (error) {
-      return { ok: false, error: errText(error) }
+    const previous = workspaceEntitiesForSession(id)
+    const workspace = await reattachSessionWorkspace(id)
+    if (!workspace.ok) return { ok: false, error: workspace.error, workspace }
+    const restored = await setArchivedSessionState(id, false)
+    if (!restored.ok) {
+      const detach = await detachWorkspaceSession(id)
+      const rollback = await restoreWorkspaceMemberships(id, previous)
+      return {
+        ok: false,
+        error: `恢复归档状态失败: ${restored.error}`,
+        restored,
+        detach,
+        rollback
+      }
     }
+    return { ok: true, id, workspace, restored }
   }
 
   /** 为已持久化但未分组、且 cwd 能解析到工作区的会话补齐工作区关联。 */
@@ -655,6 +903,69 @@ export function apply(ctx) {
       }
     }
     return { ok: true, repaired, skipped }
+  }
+
+  /**
+   * 删除当前 sessionQuery 已不可见会话的投影缓存、工作区悬空引用和归档标记。
+   * 该动作只处理派生索引，不删除仍在 DSH 持久化中的日志文件。
+   */
+  const cleanupInvalidIndex = async () => {
+    const records = await ctx.sessionQuery.listSessions()
+    const known = new Set(records.map((record) => record.header && record.header.id).filter(Boolean))
+    const removedCacheIds = []
+    const removedWorkspace = []
+    const removedArchiveIds = []
+    const skipped = []
+
+    const cacheTable = projectionCacheDomainTable()
+    if (cacheTable && typeof cacheTable.keys === 'function') {
+      for (const id of [...cacheTable.keys()]) {
+        if (known.has(id)) continue
+        try {
+          await cacheTable.delete(id)
+          removedCacheIds.push(id)
+        } catch (error) {
+          skipped.push({ target: 'cache', id, error: errText(error) })
+        }
+      }
+    } else {
+      skipped.push({ target: 'cache', error: '投影缓存领域不可用' })
+    }
+
+    const workspaceTable = workspaceDomainTable()
+    if (workspaceTable && typeof workspaceTable.entries === 'function') {
+      for (const [workspaceId, record] of [...workspaceTable.entries()]) {
+        if (!Array.isArray(record.sessionIds)) continue
+        const workspace = ctx.workspaceRegistry.get(workspaceId)
+        if (!workspace || typeof workspace.detachSession !== 'function') {
+          skipped.push({ target: 'workspace', id: workspaceId, error: '工作区实体不可用' })
+          continue
+        }
+        for (const sessionId of record.sessionIds) {
+          if (known.has(sessionId)) continue
+          try {
+            await workspace.detachSession(sessionId)
+            removedWorkspace.push({ workspaceId, sessionId })
+          } catch (error) {
+            skipped.push({ target: 'workspace', workspaceId, sessionId, error: errText(error) })
+          }
+        }
+      }
+    } else {
+      skipped.push({ target: 'workspace', error: '工作区持久化领域不可用' })
+    }
+
+    const archived = Array.isArray(ctx.workspaceRegistry.archivedSessionIds)
+      ? [...ctx.workspaceRegistry.archivedSessionIds]
+      : []
+    for (const id of archived) {
+      if (known.has(id)) continue
+      const archive = await setArchivedSessionState(id, false)
+      if (archive.ok) removedArchiveIds.push(id)
+      else skipped.push({ target: 'archive', id, error: archive.error })
+    }
+
+    return { ok: true, removedCacheIds, removedWorkspace, removedArchiveIds, skipped }
   }
 
   /**
@@ -892,12 +1203,14 @@ export function apply(ctx) {
   const dispatch = async (method, args) => {
     switch (method) {
       case 'list': return listSessions(args)
+      case 'version': return { ok: true, version: pluginVersion }
       case 'detail': return detailSession(args)
       case 'archive': return runWithRequiredId(args, archiveSessionById)
       case 'restore': return runWithRequiredId(args, restoreSession)
       case 'delete': return runWithRequiredId(args, (id) => finishLiveAndStoreSession(id, STORAGE_AREAS.trash))
       case 'move': return moveSession(args)
       case 'repair': return repairWorkspaceGroups()
+      case 'cleanup': return cleanupInvalidIndex()
       case 'backup': return runWithRequiredId(args, (id) => finishLiveAndStoreSession(id, STORAGE_AREAS.backup))
       case 'backupRestore': return runWithRequiredId(args, (id) => restoreFromStorageSession(id, STORAGE_AREAS.backup))
       case 'trashRestore': return runWithRequiredId(args, (id) => restoreFromStorageSession(id, STORAGE_AREAS.trash))

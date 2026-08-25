@@ -10,10 +10,10 @@ import { fileURLToPath } from 'node:url'
 import { zstdCompressSync } from 'node:zlib'
 
 // 测试使用独立 DSH_HOME，避免读取或写入用户 profile 中真实的 trash/backup 清单。
-// 由于 index.js 在模块加载时读取 DSH_HOME，因此必须先设置环境变量再动态导入。
+// 由于 lib/index.js 在模块加载时读取 DSH_HOME，因此必须先设置环境变量再动态导入。
 const testHome = mkdtempSync(join(tmpdir(), 'session-manager-custom-test-'))
 process.env.DSH_HOME = testHome
-const { apply, version } = await import('../index.js')
+const { apply, version } = await import('../lib/index.js')
 
 after(() => {
   rmSync(testHome, { recursive: true, force: true })
@@ -112,7 +112,7 @@ test('list returns an empty session list', async () => {
 test('version comes from the plugin package.json declaration', async () => {
   const packagePath = fileURLToPath(new URL('../package.json', import.meta.url))
   const packageVersion = JSON.parse(readFileSync(packagePath, 'utf8')).version
-  const clientPath = fileURLToPath(new URL('../client.js', import.meta.url))
+  const clientPath = fileURLToPath(new URL('../lib/client.js', import.meta.url))
   const clientSource = readFileSync(clientPath, 'utf8')
   const { route } = createContext()
 

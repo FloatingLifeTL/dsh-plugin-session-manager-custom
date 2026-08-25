@@ -151,6 +151,6 @@ Client 侧负责：
 
 - `README.md`、`docs/project.md`、代码、测试与包元数据应随版本保持一致。
 - 公开发布不包含本地运维文档、私有标记文件、本机路径或真实用户数据。
-- 仓库保留适配两种仓库布局的 Windows `scripts/install.ps1`，用于本地 tarball 安装和更新。
+- 公开仓库根目录中的 `scripts/install.ps1` 用于本地 tarball 安装和更新，并依赖当前包目录布局；`scripts/uninstall.ps1` 使用内置稳定包名调用官方 DSH 卸载命令，再清理本插件的备份区和回收站目录，可以脱离仓库独立运行。
 - GitHub 仓库应添加 `dsh-plugin` topic。
 - 当前许可证为 MIT。

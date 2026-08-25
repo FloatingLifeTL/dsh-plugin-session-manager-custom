@@ -12,10 +12,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node --check index.js
-      - run: node --check client.js
+      - run: node --check lib/index.js
+      - run: node --check lib/client.js
       - run: node --test tests/host.test.js
       - run: npm pack --dry-run
+      - name: Check release-note layout
+        shell: pwsh
+        run: .\scripts\release-notes.ps1 -Check
       - name: Check installer with Windows PowerShell 5.1
         shell: powershell
         run: |

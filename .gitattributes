@@ -5,4 +5,4 @@
 *.ps1 text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
-VERSION text eol=lf
+docs/VERSION text eol=lf

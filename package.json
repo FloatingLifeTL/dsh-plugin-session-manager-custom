@@ -1,6 +1,6 @@
 {
   "name": "@dsh-local/session-manager-custom",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Persistent custom session data manager for the DSH web profile",
   "private": true,
   "license": "MIT",
@@ -14,19 +14,19 @@
     "session-manager"
   ],
   "type": "module",
-  "main": "index.js",
+  "main": "lib/index.js",
   "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
-    "index.js",
-    "client.js",
+    "lib",
     "cordis.patch.yml",
     "LICENSE",
     "scripts/install.ps1",
-    "CHANGELOG.md"
+    "scripts/uninstall.ps1",
+    "docs/releases"
   ],
   "dsh": {
     "bundle": {

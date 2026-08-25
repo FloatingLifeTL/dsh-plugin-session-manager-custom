@@ -7,3 +7,6 @@ TempData/
 # GitHub 工作流与本地产物
 dist/
 build/
+
+# 私有目录
+_Private/

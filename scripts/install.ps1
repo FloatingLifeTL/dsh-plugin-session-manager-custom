@@ -3,9 +3,7 @@
 通过官方 DSH 插件管理器安装或更新 session-manager-custom。
 
 .DESCRIPTION
-该脚本支持两种 bundle 目录布局：
-- 嵌套布局：仓库中包含 @dsh-local/session-manager-custom。
-- 独立布局：仓库根目录本身就是 bundle 根目录。
+该脚本假定脚本与 `package.json` 位于同一个公开仓库根目录，只从脚本所在目录的上一级解析 bundle 根目录。
 
 安装前会迁移旧的手动 web/cordis.patch.yml 注册；旧配置会先备份，
 成功后默认删除临时备份（除非使用 -KeepBackup）。回收站和备份区不会被处理。
@@ -38,6 +36,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# 优先使用隔离的 DSH_HOME，避免测试或安装过程污染默认 profile。
 function Get-DshHome {
   if (-not [string]::IsNullOrWhiteSpace($env:DSH_HOME)) {
     return $env:DSH_HOME
@@ -45,37 +44,38 @@ function Get-DshHome {
   return Join-Path $HOME '.dsh'
 }
 
-# 只在脚本所属仓库根目录和其内部嵌套 bundle 中查找，不向父目录越界探测。
+# 固定以脚本所在目录的上一级作为唯一 bundle 根目录。
 function Resolve-BundleRoot {
   $scriptDir = $PSScriptRoot
   $root = Split-Path -Parent $scriptDir
-  $candidates = @(
-    $root,
-    (Join-Path $root '@dsh-local\session-manager-custom')
-  )
+  $manifest = Join-Path $root 'package.json'
 
-  foreach ($candidate in $candidates) {
-    $manifest = Join-Path $candidate 'package.json'
-    if (-not (Test-Path -LiteralPath $manifest)) { continue }
-
-    try {
-      $package = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch {
-      continue
-    }
-
-    $bundle = $package.dsh
-    if ($null -eq $bundle -or $null -eq $bundle.bundle) { continue }
-    $patchRelative = [string]$bundle.bundle.patch
-    if ([string]::IsNullOrWhiteSpace($patchRelative)) { continue }
-
-    $patchPath = Join-Path $candidate $patchRelative
-    if (Test-Path -LiteralPath $patchPath) {
-      return (Resolve-Path -LiteralPath $candidate).Path
-    }
+  if (-not (Test-Path -LiteralPath $manifest)) {
+    throw '找不到 bundle 根目录。请确认 scripts/install.ps1 与 package.json 保持相邻目录结构。'
   }
 
-  throw '找不到可作为 DSH bundle 安装的插件根目录。请确认 install.ps1 与插件文件保持原有目录结构。'
+  try {
+    $package = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+  } catch {
+    throw "无法读取 bundle 清单：$manifest"
+  }
+
+  $bundle = $package.dsh
+  if ($null -eq $bundle -or $null -eq $bundle.bundle) {
+    throw 'package.json 缺少 DSH bundle 配置。'
+  }
+
+  $patchRelative = [string]$bundle.bundle.patch
+  if ([string]::IsNullOrWhiteSpace($patchRelative)) {
+    throw 'package.json 的 dsh.bundle.patch 为空。'
+  }
+
+  $patchPath = Join-Path $root $patchRelative
+  if (-not (Test-Path -LiteralPath $patchPath)) {
+    throw "找不到 DSH bundle patch：$patchPath"
+  }
+
+  return (Resolve-Path -LiteralPath $root).Path
 }
 
 # 识别旧 web/cordis.patch.yml 中由本插件使用的手动注册项。
@@ -183,6 +183,7 @@ try {
     throw 'dsh plugin 需要 pnpm；请安装并配置 pnpm 后重试。'
   }
 
+  # 先确定唯一 bundle 根目录，再构造 profile 下的安装缓存和迁移路径。
   $bundleRoot = Resolve-BundleRoot
   $dshHomePath = Get-DshHome
   $profileDir = Join-Path (Join-Path $dshHomePath 'profiles') $ProfileName
@@ -190,6 +191,7 @@ try {
   $cacheDir = Join-Path $profileDir '.dsh-local-install'
   $backupPath = $null
 
+  # 每次安装前清空缓存目录中的旧 tarball，避免误用上一点版本。
   New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
   Get-ChildItem -LiteralPath $cacheDir -Filter '*.tgz' -File -ErrorAction SilentlyContinue | Remove-Item -Force
 
@@ -264,12 +266,6 @@ try {
   }
 
   Remove-TemporaryBackup -BackupPath $backupPath
-
-  $legacyParent = Join-Path $dshHomePath 'profiles\node_modules\@dsh-local\session-manager-custom'
-  if (Test-Path -LiteralPath $legacyParent) {
-    Write-Warning "旧的父级手动插件目录仍存在: $legacyParent"
-    Write-Warning '新安装验证成功后，可按需删除该目录；回收站和备份区目录不受影响。'
-  }
 
   Write-Host "已通过标准 DSH bundle 注册安装/更新插件到 profile: $ProfileName"
   Write-Host '请重启 DSH 并刷新 Web 页面。'
